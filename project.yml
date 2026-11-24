@@ -1,0 +1,27 @@
+name: XqAssist
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  XqAssist:
+    type: application
+    platform: iOS
+    sources:
+      - path: .
+        includes: ["*.swift"]
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: 象棋助手
+        NSCameraUsageDescription: 需要使用摄像头识别棋盘
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.xqassist
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGNING_ALLOWED: "NO"
