@@ -293,6 +293,15 @@ struct Hit {
     var conf: Float
 }
 
+/// 整盘 OCR 映射到校正后棋盘的交点坐标
+struct BoardGlyphHit {
+    var row: Int
+    var col: Int
+    var type: Int
+    var side: Int
+    var conf: Float
+}
+
 enum Glyph {
     static let table: [Character: (Int, Int)] = [
         "帅": (1, 1), "帥": (1, 1), "将": (1, -1), "將": (1, -1),
@@ -320,6 +329,43 @@ enum OCR {
                     if let g = Glyph.table[ch] {
                         hits.append(Hit(type: g.0, side: g.1, conf: cand.confidence))
                     }
+                }
+            }
+        }
+        return hits
+    }
+
+    /// 在整张透视校正棋盘上识别文字。单格裁剪会丢失字形上下文，
+    /// 整盘识别能利用字形周围信息；识别框再映射回最近的棋盘交点。
+    static func boardHits(_ R: Rectified) -> [BoardGlyphHit] {
+        let cg = R.cg
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate
+        req.recognitionLanguages = ["zh-Hans", "zh-Hant"]
+        req.usesLanguageCorrection = true
+        req.minimumTextHeight = 0.014
+        req.customWords = ["帅", "帥", "将", "將", "仕", "士", "相", "象", "马", "馬", "傌", "车", "車", "俥", "炮", "砲", "兵", "卒"]
+        let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+        do { try handler.perform([req]) } catch { return [] }
+
+        var hits = [BoardGlyphHit]()
+        let cellSize = CGFloat(Analyzer.cell)
+        for obs in req.results ?? [] {
+            let box = obs.boundingBox
+            for cand in obs.topCandidates(3) {
+                let chars = Array(cand.string)
+                guard !chars.isEmpty else { continue }
+                for (j, ch) in chars.enumerated() {
+                    guard let glyph = Glyph.table[ch] else { continue }
+                    // 中文一字一格；若 Vision 把一整行合成一个候选，按字序分配框内横坐标。
+                    let fx = (CGFloat(j) + 0.5) / CGFloat(chars.count)
+                    let px = (box.minX + box.width * fx) * CGFloat(cg.width)
+                    let py = (1.0 - box.midY) * CGFloat(cg.height)
+                    let col = Int(((px - cellSize / 2) / cellSize).rounded())
+                    let row = Int(((py - cellSize / 2) / cellSize).rounded())
+                    guard (0..<9).contains(col), (0..<10).contains(row) else { continue }
+                    hits.append(BoardGlyphHit(row: row, col: col, type: glyph.0,
+                                            side: glyph.1, conf: cand.confidence))
                 }
             }
         }
@@ -713,7 +759,7 @@ enum Analyzer {
                 guard let img = paddedCrop(R, r, c, quarterTurns: turn, inset: inset) else { continue }
                 let variants = [img, contrastImage(img)].compactMap { $0 }
                 for variant in variants {
-                    let hits = OCR.run(variant, minHeight: 0.075)
+                    let hits = OCR.run(variant, minHeight: 0.035)
                     for h in hits where h.conf >= 0.18 {
                         var side = h.side
                         if side == 0 { side = colorSide(R, c, r) }
@@ -853,10 +899,39 @@ final class Recognizer {
         var codes = [Int](repeating: 0, count: 90)
         var descs: [Int: [Float]] = [:]
         var todo = [Int]()
+
+        // 第一轮：整盘识字。只允许把文字落到“已检测到棋子”的交点，避免把楚河汉界等字误当棋子。
+        let occupiedSet = Set(occupied)
+        var boardVotes = [Int: [Int: Float]]()
+        for h in OCR.boardHits(R) where h.conf >= 0.16 {
+            let i = h.row * 9 + h.col
+            guard occupiedSet.contains(i) else { continue }
+            var side = h.side
+            if side == 0 { side = Analyzer.colorSide(R, h.col, h.row) }
+            if side == 0 {
+                // 红黑共用字形在反光/褪色时无法读出颜色；标准棋盘阵营位置作为最后兜底。
+                side = h.row <= 4 ? -1 : 1
+            }
+            let code = side * h.type
+            boardVotes[i, default: [:]][code, default: 0] += h.conf
+        }
+        for (i, votes) in boardVotes {
+            if let best = votes.max(by: { $0.value < $1.value }), best.value >= 0.28 {
+                codes[i] = best.key
+            }
+        }
+
+        // 第二轮：用户曾纠正过的棋子外观模板；整盘 OCR 已认出的格子不再重复处理。
         for i in occupied {
             let d = Analyzer.descriptor(R, i / 9, i % 9)
             descs[i] = d
-            if let m = matchBank(d), m.1 >= 0.8 { codes[i] = m.0 } else { todo.append(i) }
+            if codes[i] != 0 {
+                learn(codes[i], d)
+            } else if let m = matchBank(d), m.1 >= 0.8 {
+                codes[i] = m.0
+            } else {
+                todo.append(i)
+            }
         }
         if !todo.isEmpty {
             let todoList = todo
