@@ -314,9 +314,13 @@ enum OCR {
         do { try handler.perform([req]) } catch { return [] }
         var hits = [Hit]()
         for obs in req.results ?? [] {
-            guard let cand = obs.topCandidates(1).first else { continue }
-            for ch in cand.string {
-                if let g = Glyph.table[ch] { hits.append(Hit(type: g.0, side: g.1, conf: cand.confidence)) }
+            // 不只取 Vision 的第一候选；斜拍、反光、字体磨损时第二/第三候选常更正确。
+            for cand in obs.topCandidates(3) {
+                for ch in cand.string {
+                    if let g = Glyph.table[ch] {
+                        hits.append(Hit(type: g.0, side: g.1, conf: cand.confidence))
+                    }
+                }
             }
         }
         return hits
@@ -325,12 +329,12 @@ enum OCR {
     /// 矩形候选（棋盘外框），返回 k-px 坐标，顺序 左上/右上/右下/左下
     static func rectangles(_ cg: CGImage) -> [[CGPoint]] {
         let req = VNDetectRectanglesRequest()
-        req.minimumAspectRatio = 0.5
-        req.maximumAspectRatio = 1.0
-        req.minimumSize = 0.15
+        req.minimumAspectRatio = 0.30
+        req.maximumAspectRatio = 1.35
+        req.minimumSize = 0.10
         req.minimumConfidence = 0.2
         req.maximumObservations = 12
-        req.quadratureTolerance = 45
+        req.quadratureTolerance = 60
         let handler = VNImageRequestHandler(cgImage: cg, options: [:])
         do { try handler.perform([req]) } catch { return [] }
         let W = Double(cg.width), H = Double(cg.height)
@@ -457,7 +461,7 @@ enum Geo {
     static func hypotheses(quads: [[CGPoint]], imgW: Double, imgH: Double) -> [[CGPoint]] {
         var out = [[CGPoint]]()
         for q in quads where q.count == 4 {
-            for a in [0.0, 0.4, 0.6, 0.8, 1.0, 1.3] {
+            for a in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.3, 1.6, 2.0] {
                 let mx = a / (8 + 2 * a), my = a / (9 + 2 * a)
                 func bil(_ u: Double, _ v: Double) -> CGPoint {
                     let w0 = (1 - u) * (1 - v), w1 = u * (1 - v), w2 = u * v, w3 = (1 - u) * v
@@ -494,7 +498,7 @@ enum Geo {
         var bestC: [CGPoint]? = nil
         var bestV = -1.0
         for (c, _) in scored.prefix(6) {
-            let r = refine(G, c, step0: 0.02)
+            let r = refine(G, c, step0: 0.035)
             if r.1 > bestV { bestV = r.1; bestC = r.0 }
         }
         guard let bc = bestC else { return nil }
@@ -570,6 +574,8 @@ enum Analyzer {
         var n1 = 0, dr = 0, dg = 0, db = 0
         var nc = 0, cr = 0, cg2 = 0, cb = 0
         var nr = 0, ink = 0
+        // 棋子圆盘边缘的环形对比度：对斜拍、木纹/棋盘线干扰更稳。
+        var innerLum = 0, innerN = 0, outerLum = 0, outerN = 0
         for dy in -47...47 {
             for dx in -47...47 {
                 let d2 = dx * dx + dy * dy
@@ -578,7 +584,14 @@ enum Analyzer {
                 if d2 <= 676 {
                     n1 += 1
                     dr += Int(R.rgba[p]); dg += Int(R.rgba[p + 1]); db += Int(R.rgba[p + 2])
-                } else if d2 >= 1156 && d2 <= 1936 {
+                }
+                let radius2 = dx * dx + dy * dy
+                if radius2 >= 28 * 28 && radius2 <= 36 * 36 {
+                    innerLum += Int(R.lum[o]); innerN += 1
+                } else if radius2 >= 41 * 41 && radius2 <= 46 * 46 {
+                    outerLum += Int(R.lum[o]); outerN += 1
+                }
+                if d2 >= 1156 && d2 <= 1936 {
                     nr += 1
                     let rr = Int(R.rgba[p]), gg = Int(R.rgba[p + 1]), bb = Int(R.rgba[p + 2])
                     let isRed: Bool = rr > 110 && rr > 2 * gg && rr > 2 * bb
@@ -597,7 +610,8 @@ enum Analyzer {
         let sq: Float = ex * ex + ey * ey + ez * ez
         let cdist: Float = sq.squareRoot() / 255
         let ring: Float = Float(ink) / Float(max(nr, 1))
-        return cdist + 0.6 * ring
+        let edge: Float = abs(Float(innerLum) / Float(max(innerN, 1)) - Float(outerLum) / Float(max(outerN, 1))) / 255
+        return cdist + 0.6 * ring + 0.35 * edge
     }
 
     /// 格子中心 72x72 区域的 24x24 灰度描述子（圆形掩码，零均值、单位长度），用来认"见过的棋子"
@@ -657,9 +671,11 @@ enum Analyzer {
         return 0
     }
 
-    /// 单个格子放大、加白边后做文字识别（正着认一次，认不出再倒过来认一次）
-    static func paddedCrop(_ R: Rectified, _ r: Int, _ c: Int, rotate: Bool) -> CGImage? {
-        let rect = CGRect(x: c * cell, y: r * cell, width: cell, height: cell)
+    /// 对透视校正后的格子做多尺度裁剪；先切掉交叉点/网格线，再旋转适配棋子朝向。
+    static func paddedCrop(_ R: Rectified, _ r: Int, _ c: Int, quarterTurns: Int, inset: Int) -> CGImage? {
+        let safeInset = max(0, min(inset, 22))
+        let rect = CGRect(x: c * cell + safeInset, y: r * cell + safeInset,
+                          width: cell - 2 * safeInset, height: cell - 2 * safeInset)
         guard let crop = R.cg.cropping(to: rect) else { return nil }
         let S = 288
         guard let g = CGContext(data: nil, width: S, height: S, bitsPerComponent: 8, bytesPerRow: 0,
@@ -667,28 +683,54 @@ enum Analyzer {
                                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         g.setFillColor(UIColor.white.cgColor)
         g.fill(CGRect(x: 0, y: 0, width: S, height: S))
-        if rotate {
+        if quarterTurns != 0 {
             g.translateBy(x: CGFloat(S) / 2, y: CGFloat(S) / 2)
-            g.rotate(by: .pi)
+            g.rotate(by: CGFloat(quarterTurns) * .pi / 2)
             g.translateBy(x: -CGFloat(S) / 2, y: -CGFloat(S) / 2)
         }
-        g.draw(crop, in: CGRect(x: 48, y: 48, width: 192, height: 192))
+        g.interpolationQuality = .high
+        g.draw(crop, in: CGRect(x: 30, y: 30, width: 228, height: 228))
         return g.makeImage()
     }
 
-    /// 返回带符号的棋子编码（红正黑负），认不出返回 0
+    /// 生成灰度高对比副本，帮助识别暗字、反光和颜色偏移的棋子。
+    static func contrastImage(_ image: CGImage) -> CGImage? {
+        let f = CIFilter.colorControls()
+        f.inputImage = CIImage(cgImage: image)
+        f.saturation = 0
+        f.contrast = 1.55
+        f.brightness = 0.015
+        guard let out = f.outputImage else { return nil }
+        return ctx.createCGImage(out, from: out.extent)
+    }
+
+    /// 返回棋子编码（红正黑负）。多方向、多裁剪、多对比度投票，降低斜拍和反光漏识。
     static func ocrCell(_ R: Rectified, _ r: Int, _ c: Int) -> Int {
-        for rot in [false, true] {
-            guard let img = paddedCrop(R, r, c, rotate: rot) else { continue }
-            let hits = OCR.run(img, minHeight: 0.1)
-            if let h = hits.max(by: { $0.conf < $1.conf }), h.conf >= 0.3 {
-                var side = h.side
-                if side == 0 { side = colorSide(R, c, r) }
-                if side == 0 { continue }
-                return side * h.type
+        var votes: [Int: Float] = [:]
+        // 角度已由单应性拉正，棋子字样仍可能上下/侧向；测试四个方向。
+        for turn in 0..<4 {
+            for inset in [8, 16] { // 细裁去网格；宽裁保留棋子边缘/较大字样
+                guard let img = paddedCrop(R, r, c, quarterTurns: turn, inset: inset) else { continue }
+                let variants = [img, contrastImage(img)].compactMap { $0 }
+                for variant in variants {
+                    let hits = OCR.run(variant, minHeight: 0.075)
+                    for h in hits where h.conf >= 0.18 {
+                        var side = h.side
+                        if side == 0 { side = colorSide(R, c, r) }
+                        if side != 0 {
+                            let code = side * h.type
+                            votes[code, default: 0] += h.conf
+                        }
+                    }
+                }
+            }
+            // 很有把握的结果无需继续跑所有增强图，控制拍照识别耗时。
+            if let best = votes.max(by: { $0.value < $1.value }), best.value >= 1.35 {
+                return best.key
             }
         }
-        return 0
+        guard let best = votes.max(by: { $0.value < $1.value }), best.value >= 0.35 else { return 0 }
+        return best.key
     }
 }
 
@@ -801,9 +843,9 @@ final class Recognizer {
             if n0 > 0 { c0 = s0 / n0 }
             if n1 > 0 { c1 = s1 / n1 }
         }
-        let thr = c0 + 0.4 * (c1 - c0)
+        let thr = c0 + 0.30 * (c1 - c0)
         var occupied = [Int]()
-        if c1 - c0 > 0.12 {
+        if c1 - c0 > 0.10 {
             for i in 0..<90 where sc[i] > thr { occupied.append(i) }
         }
 
